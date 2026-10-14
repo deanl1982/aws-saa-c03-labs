@@ -1,0 +1,472 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SAA-C03 Capstone - highly available 3-tier web application.
+  Multi-AZ VPC, NAT, S3 gateway endpoint, ALB, Auto Scaling web tier,
+  Aurora MySQL Serverless v2 (writer + reader), Secrets Manager, CloudFront, and alarms.
+
+Parameters:
+  EnvName:
+    Type: String
+    Default: saa-capstone
+    Description: Prefix used for resource names and tags.
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/16$'
+    Description: /16 CIDR for the capstone VPC (must not overlap saa-vpc 10.0.0.0/16).
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+  HighlyAvailableNat:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: true = one NAT gateway per AZ (resilient, ~2x NAT cost). false = single NAT gateway (cheaper).
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: Optional email address for operational alarms.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  NatPerAz: !Equals [!Ref HighlyAvailableNat, "true"]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-vpc" }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-igw" }]
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-public-a" }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 6, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-public-b" }]
+  AppSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-app-a" }]
+  AppSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-app-b" }]
+  DataSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [4, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-data-a" }]
+  DataSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [5, !Cidr [!Ref VpcCidr, 6, 8]]
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-data-b" }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-public-rt" }]
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetA, RouteTableId: !Ref PublicRouteTable }
+  PublicSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnetB, RouteTableId: !Ref PublicRouteTable }
+
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: IgwAttachment
+    Properties: { Domain: vpc }
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-nat-a" }]
+  NatEipB:
+    Type: AWS::EC2::EIP
+    Condition: NatPerAz
+    DependsOn: IgwAttachment
+    Properties: { Domain: vpc }
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Condition: NatPerAz
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-nat-b" }]
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-private-rt-a" }]
+  PrivateRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-private-rt-b" }]
+  PrivateRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [NatPerAz, !Ref NatGatewayB, !Ref NatGatewayA]
+  AppSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetA, RouteTableId: !Ref PrivateRouteTableA }
+  AppSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref AppSubnetB, RouteTableId: !Ref PrivateRouteTableB }
+  DataSubnetARta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataSubnetA, RouteTableId: !Ref PrivateRouteTableA }
+  DataSubnetBRta:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref DataSubnetB, RouteTableId: !Ref PrivateRouteTableB }
+
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref Vpc
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
+      VpcEndpointType: Gateway
+      RouteTableIds: [!Ref PrivateRouteTableA, !Ref PrivateRouteTableB]
+
+  # ---------------------------------------------------------------- Security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - HTTP from anywhere
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-alb-sg" }]
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App tier - HTTP from ALB only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-app-sg" }]
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB tier - MySQL from app tier only
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 3306, ToPort: 3306, SourceSecurityGroupId: !Ref AppSecurityGroup }
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-db-sg" }]
+
+  # ---------------------------------------------------------------- Database
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Capstone data subnets
+      SubnetIds: [!Ref DataSubnetA, !Ref DataSubnetB]
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete          # use Snapshot in production
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-mysql
+      DatabaseName: capstone
+      MasterUsername: admin
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VpcSecurityGroupIds: [!Ref DbSecurityGroup]
+      StorageEncrypted: true
+      BackupRetentionPeriod: 1
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      Tags: [{ Key: Name, Value: !Sub "${EnvName}-aurora" }]
+
+  DbWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      Engine: aurora-mysql
+      DBInstanceClass: db.serverless
+      PromotionTier: 0
+
+  DbReader:
+    Type: AWS::RDS::DBInstance
+    DependsOn: DbWriter
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      Engine: aurora-mysql
+      DBInstanceClass: db.serverless
+      PromotionTier: 1
+
+  # ---------------------------------------------------------------- IAM for instances
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !GetAtt DbCluster.MasterUserSecret.SecretArn
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ---------------------------------------------------------------- Web tier
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn: DbWriter
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: { Arn: !GetAtt InstanceProfile.Arn }
+        SecurityGroupIds: [!Ref AppSecurityGroup]
+        MetadataOptions: { HttpTokens: required, HttpEndpoint: enabled }
+        Monitoring: { Enabled: true }
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{ Key: Name, Value: !Sub "${EnvName}-web" }]
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            dnf -y install httpd mariadb105 jq
+            TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            ID=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            SECRET=$(aws secretsmanager get-secret-value --region ${AWS::Region} --secret-id ${DbCluster.MasterUserSecret.SecretArn} --query SecretString --output text)
+            DBUSER=$(echo "$SECRET" | jq -r .username)
+            DBPASS=$(echo "$SECRET" | jq -r .password)
+            if mysql -h ${DbCluster.Endpoint.Address} -u "$DBUSER" -p"$DBPASS" -e "SELECT 1" >/dev/null 2>&1; then DB="connected to Aurora writer"; else DB="UNREACHABLE"; fi
+            cat > /var/www/html/index.html <<HTML
+            <html><body style="font-family:sans-serif">
+            <h1>SAA-C03 Capstone</h1>
+            <p><b>Instance:</b> $ID</p>
+            <p><b>Availability Zone:</b> $AZ</p>
+            <p><b>Database:</b> $DB</p>
+            </body></html>
+            HTML
+            echo OK > /var/www/html/health
+            systemctl enable --now httpd
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${EnvName}-alb"
+      Scheme: internet-facing
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  WebAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: [PrivateRouteA, PrivateRouteB]
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT2M
+    Properties:
+      VPCZoneIdentifier: [!Ref AppSubnetA, !Ref AppSubnetB]
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: "2"
+      MaxSize: "6"
+      DesiredCapacity: "2"
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 180
+      TargetGroupARNs: [!Ref TargetGroup]
+      Tags:
+        - { Key: Project, Value: !Ref EnvName, PropagateAtLaunch: true }
+
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref WebAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification: { PredefinedMetricType: ASGAverageCPUUtilization }
+        TargetValue: 50
+
+  # ---------------------------------------------------------------- Edge
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${EnvName} edge"
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: alb-origin
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: alb-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad         # Managed-CachingDisabled (dynamic app)
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3 # Managed-AllViewer
+
+  # ---------------------------------------------------------------- Monitoring
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${EnvName}-alarms"
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: One or more web targets unhealthy
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: ALB returning 5xx errors
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_ELB_5XX_Count
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt LoadBalancer.LoadBalancerFullName }
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+Outputs:
+  CloudFrontUrl:
+    Description: Public HTTPS entry point
+    Value: !Sub "https://${Distribution.DomainName}"
+  AlbUrl:
+    Description: Direct ALB URL (HTTP)
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+  VpcId:
+    Value: !Ref Vpc
+  AppSubnets:
+    Value: !Join [",", [!Ref AppSubnetA, !Ref AppSubnetB]]
+  AsgName:
+    Value: !Ref WebAsg
+  DbClusterId:
+    Value: !Ref DbCluster
+  DbWriterEndpoint:
+    Value: !GetAtt DbCluster.Endpoint.Address
+  DbReaderEndpoint:
+    Value: !GetAtt DbCluster.ReadEndpoint.Address
+  DbSecretArn:
+    Value: !GetAtt DbCluster.MasterUserSecret.SecretArn
+  AppSecurityGroupId:
+    Value: !Ref AppSecurityGroup
